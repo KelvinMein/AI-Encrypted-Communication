@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Week 2: Browser Crypto Test</title>
+</head>
+<body>
+  <h2>Kelvin and Mein: browser encryption test</h2>
+  <pre id="output">Running...</pre>
+
+  <script>
+    const out = document.getElementById("output");
+    const log = (msg) => { out.textContent += "\n" + msg; };
+    const toHex = (buf) =>
+      Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+
+    async function run() {
+      out.textContent = "";
+
+      // Step 1: each party generates an ECDH key pair (P-256)
+      const params = { name: "ECDH", namedCurve: "P-256" };
+      const kelvin = await crypto.subtle.generateKey(params, true, ["deriveKey"]);
+      const mein = await crypto.subtle.generateKey(params, true, ["deriveKey"]);
+
+      // Step 2: each side derives the same AES-GCM key from its private key + the other's public key
+      const aesParams = { name: "AES-GCM", length: 256 };
+      const kelvinKey = await crypto.subtle.deriveKey(
+        { name: "ECDH", public: mein.publicKey },
+        kelvin.privateKey, aesParams, false, ["encrypt", "decrypt"]
+      );
+      const meinKey = await crypto.subtle.deriveKey(
+        { name: "ECDH", public: kelvin.publicKey },
+        mein.privateKey, aesParams, false, ["encrypt", "decrypt"]
+      );
+      log("Key exchange done: both sides derived an AES-256 key");
+
+      // Step 3: Kelvin encrypts
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode("Hello Mein, this message is end-to-end encrypted.");
+      const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, kelvinKey, plaintext);
+      log("Ciphertext (what an attacker would see): " + toHex(ciphertext));
+
+      // Step 4: Mein decrypts with his independently derived key
+      const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, meinKey, ciphertext);
+      log("Decrypted message: " + new TextDecoder().decode(decrypted));
+    }
+
+    run().catch(e => { out.textContent = "Error: " + e; });
+  </script>
+</body>
+</html>
