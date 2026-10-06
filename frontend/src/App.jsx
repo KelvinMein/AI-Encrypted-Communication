@@ -1,30 +1,61 @@
 import { useState } from "react";
 
 function App() {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [result, setResult] = useState("");
+  // Registration state
+  const [regEmail, setRegEmail] = useState("");
+  const [regPassword, setRegPassword] = useState("");
+  const [regResult, setRegResult] = useState("");
+
+  // Login state
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginResult, setLoginResult] = useState("");
+  const [token, setToken] = useState("");
 
   async function handleRegister(e) {
     e.preventDefault();
-    setResult("Registering...");
+    setRegResult("Registering...");
 
     try {
       const response = await fetch("http://127.0.0.1:8000/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: regEmail, password: regPassword }),
       });
 
       const data = await response.json();
 
       if (response.ok) {
-        setResult(`Registered successfully: ${data.email}`);
+        setRegResult(`Registered successfully: ${data.email}`);
       } else {
-        setResult(`Error: ${data.detail}`);
+        setRegResult(`Error: ${data.detail}`);
       }
     } catch (err) {
-      setResult(`Network error: ${err.message}`);
+      setRegResult(`Network error: ${err.message}`);
+    }
+  }
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    setLoginResult("Logging in...");
+
+    try {
+      const response = await fetch("http://127.0.0.1:8000/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setToken(data.access_token);
+        setLoginResult("Login successful. Token received.");
+      } else {
+        setLoginResult(`Error: ${data.detail}`);
+      }
+    } catch (err) {
+      setLoginResult(`Network error: ${err.message}`);
     }
   }
 
@@ -38,28 +69,59 @@ function App() {
           <label>Email</label><br />
           <input
             type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            value={regEmail}
+            onChange={(e) => setRegEmail(e.target.value)}
             required
             style={{ width: "100%", padding: "0.5rem" }}
           />
         </div>
-
         <div style={{ marginBottom: "1rem" }}>
           <label>Password</label><br />
           <input
             type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            value={regPassword}
+            onChange={(e) => setRegPassword(e.target.value)}
             required
             style={{ width: "100%", padding: "0.5rem" }}
           />
         </div>
-
         <button type="submit" style={{ padding: "0.5rem 1rem" }}>Register</button>
       </form>
+      <p>{regResult}</p>
 
-      <p>{result}</p>
+      <hr style={{ margin: "2rem 0" }} />
+
+      <h2>Login</h2>
+      <form onSubmit={handleLogin}>
+        <div style={{ marginBottom: "1rem" }}>
+          <label>Email</label><br />
+          <input
+            type="email"
+            value={loginEmail}
+            onChange={(e) => setLoginEmail(e.target.value)}
+            required
+            style={{ width: "100%", padding: "0.5rem" }}
+          />
+        </div>
+        <div style={{ marginBottom: "1rem" }}>
+          <label>Password</label><br />
+          <input
+            type="password"
+            value={loginPassword}
+            onChange={(e) => setLoginPassword(e.target.value)}
+            required
+            style={{ width: "100%", padding: "0.5rem" }}
+          />
+        </div>
+        <button type="submit" style={{ padding: "0.5rem 1rem" }}>Login</button>
+      </form>
+      <p>{loginResult}</p>
+
+      {token && (
+        <div style={{ marginTop: "1rem", wordBreak: "break-all", fontSize: "0.8rem", color: "#555" }}>
+          <strong>Token:</strong> {token}
+        </div>
+      )}
     </div>
   );
 }
