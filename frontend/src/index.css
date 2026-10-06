@@ -1,0 +1,10 @@
+body {
+  margin: 0;
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+}
+
+#root {
+  max-width: 500px;
+  margin: 0 auto;
+  padding: 1rem;
+}
