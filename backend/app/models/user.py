@@ -8,5 +8,6 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    public_key = Column(String, nullable=True)  # filled in later when the user generates their encryption keys
+    public_key = Column(String, nullable=True)
+    signing_key = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

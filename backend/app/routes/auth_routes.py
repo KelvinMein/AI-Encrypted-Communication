@@ -63,6 +63,8 @@ def upload_key(
     db: Session = Depends(get_db),
 ):
     current_user.public_key = key_data.public_key
+    if key_data.signing_key:
+        current_user.signing_key = key_data.signing_key
     db.commit()
     return {"message": "Public key uploaded successfully"}
 
@@ -70,4 +72,7 @@ def upload_key(
 @router.get("/users")
 def list_users(db: Session = Depends(get_db)):
     users = db.query(User).filter(User.public_key.isnot(None)).all()
-    return [{"email": u.email, "public_key": u.public_key} for u in users]
+    return [
+        {"email": u.email, "public_key": u.public_key, "signing_key": u.signing_key}
+        for u in users
+    ]

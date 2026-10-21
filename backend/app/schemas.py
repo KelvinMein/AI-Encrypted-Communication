@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -21,3 +22,4 @@ class Token(BaseModel):
 
 class PublicKeyUpload(BaseModel):
     public_key: str
+    signing_key: Optional[str] = None

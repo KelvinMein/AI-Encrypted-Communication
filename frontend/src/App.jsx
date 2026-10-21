@@ -10,14 +10,18 @@ function App() {
   const [loginResult, setLoginResult] = useState("");
   const [token, setToken] = useState("");
   const [keyStatus, setKeyStatus] = useState("");
+  const [myFingerprint, setMyFingerprint] = useState("");
 
   const [users, setUsers] = useState([]);
   const [recipientEmail, setRecipientEmail] = useState("");
+  const [recipientFingerprint, setRecipientFingerprint] = useState("");
   const [messageText, setMessageText] = useState("");
   const [chatLog, setChatLog] = useState([]);
 
   const keyPairRef = useRef(null);
+  const signingKeyPairRef = useRef(null);
   const sharedKeysRef = useRef({});
+  const verifyKeysRef = useRef({});
   const wsRef = useRef(null);
   const myEmailRef = useRef("");
   const tokenRef = useRef("");
@@ -52,25 +56,49 @@ function App() {
     );
   }
 
+  async function importVerifyKey(signingKeyBase64) {
+    const raw = Uint8Array.from(atob(signingKeyBase64), (c) => c.charCodeAt(0));
+    return await crypto.subtle.importKey(
+      "raw", raw, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]
+    );
+  }
+
+  async function computeFingerprint(publicKeyBase64, signingKeyBase64) {
+    const combined = publicKeyBase64 + signingKeyBase64;
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(combined));
+    const bytes = Array.from(new Uint8Array(digest)).slice(0, 8);
+    return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
+  }
+
   async function generateAndUploadKeys(jwtToken) {
     setKeyStatus("Generating encryption keys...");
     const pair = await crypto.subtle.generateKey(
       { name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]
     );
     keyPairRef.current = pair;
-
     const rawPublicKey = await crypto.subtle.exportKey("raw", pair.publicKey);
     const publicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(rawPublicKey)));
 
-    setKeyStatus("Uploading public key...");
+    setKeyStatus("Generating signing keys...");
+    const signingPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]
+    );
+    signingKeyPairRef.current = signingPair;
+    const rawSigningPublicKey = await crypto.subtle.exportKey("raw", signingPair.publicKey);
+    const signingPublicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(rawSigningPublicKey)));
+
+    const fingerprint = await computeFingerprint(publicKeyBase64, signingPublicKeyBase64);
+    setMyFingerprint(fingerprint);
+
+    setKeyStatus("Uploading public keys...");
     const response = await fetch("http://127.0.0.1:8000/upload-key", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${jwtToken}` },
-      body: JSON.stringify({ public_key: publicKeyBase64 }),
+      body: JSON.stringify({ public_key: publicKeyBase64, signing_key: signingPublicKeyBase64 }),
     });
 
     if (response.ok) {
-      setKeyStatus("Encryption keys ready.");
+      setKeyStatus("Encryption and signing keys ready.");
       loadUsers(jwtToken);
       connectWebSocket(jwtToken);
     } else {
@@ -82,9 +110,25 @@ function App() {
   async function loadUsers(jwtToken) {
     const response = await fetch("http://127.0.0.1:8000/users", {
       headers: { Authorization: `Bearer ${jwtToken}` },
+      cache: "no-store",
     });
     const data = await response.json();
     setUsers(data.filter((u) => u.email !== myEmailRef.current));
+  }
+
+  async function getVerifyKey(email) {
+    const response = await fetch("http://127.0.0.1:8000/users", {
+      headers: { Authorization: `Bearer ${tokenRef.current}` },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    const match = data.find((u) => u.email === email);
+    if (match && match.signing_key) {
+      const key = await importVerifyKey(match.signing_key);
+      verifyKeysRef.current[email] = key;
+      return key;
+    }
+    return null;
   }
 
   function connectWebSocket(jwtToken) {
@@ -96,14 +140,30 @@ function App() {
       if (!sharedKey) return;
 
       const nonce = Uint8Array.from(atob(data.nonce), (c) => c.charCodeAt(0));
-      const ciphertext = Uint8Array.from(atob(data.ciphertext), (c) => c.charCodeAt(0));
+      const ciphertextBytes = Uint8Array.from(atob(data.ciphertext), (c) => c.charCodeAt(0));
+
+      let signatureValid = false;
+      try {
+        const verifyKey = await getVerifyKey(data.from);
+        if (verifyKey && data.signature) {
+          const signatureBytes = Uint8Array.from(atob(data.signature), (c) => c.charCodeAt(0));
+          signatureValid = await crypto.subtle.verify(
+            { name: "ECDSA", hash: "SHA-256" }, verifyKey, signatureBytes, ciphertextBytes
+          );
+        }
+      } catch (err) {
+        signatureValid = false;
+      }
 
       try {
-        const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, sharedKey, ciphertext);
+        const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, sharedKey, ciphertextBytes);
         const text = new TextDecoder().decode(decrypted);
-        setChatLog((prev) => [...prev, { from: data.from, text }]);
+        setChatLog((prev) => [
+          ...prev,
+          { from: data.from, text, verified: signatureValid },
+        ]);
       } catch (err) {
-        setChatLog((prev) => [...prev, { from: data.from, text: "[Could not decrypt message]" }]);
+        setChatLog((prev) => [...prev, { from: data.from, text: "[Could not decrypt message]", verified: false }]);
       }
     };
 
@@ -137,15 +197,20 @@ function App() {
 
   async function handleSelectRecipient(email) {
     setRecipientEmail(email);
+    setRecipientFingerprint("");
 
     const response = await fetch("http://127.0.0.1:8000/users", {
       headers: { Authorization: `Bearer ${tokenRef.current}` },
+      cache: "no-store",
     });
     const data = await response.json();
     const match = data.find((u) => u.email === email);
 
-    if (match && match.public_key) {
+    if (match && match.public_key && match.signing_key) {
       sharedKeysRef.current[email] = await deriveSharedKey(match.public_key);
+      verifyKeysRef.current[email] = await importVerifyKey(match.signing_key);
+      const fingerprint = await computeFingerprint(match.public_key, match.signing_key);
+      setRecipientFingerprint(fingerprint);
     }
   }
 
@@ -159,18 +224,31 @@ function App() {
     const nonce = crypto.getRandomValues(new Uint8Array(12));
     const plaintext = new TextEncoder().encode(messageText);
     const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, sharedKey, plaintext);
+    const ciphertextBytes = new Uint8Array(ciphertext);
+
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      signingKeyPairRef.current.privateKey,
+      ciphertextBytes
+    );
 
     const nonceBase64 = btoa(String.fromCharCode(...nonce));
-    const ciphertextBase64 = btoa(String.fromCharCode(...new Uint8Array(ciphertext)));
+    const ciphertextBase64 = btoa(String.fromCharCode(...ciphertextBytes));
+    const signatureBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
 
-    wsRef.current.send(JSON.stringify({ to: recipientEmail, ciphertext: ciphertextBase64, nonce: nonceBase64 }));
+    wsRef.current.send(JSON.stringify({
+      to: recipientEmail,
+      ciphertext: ciphertextBase64,
+      nonce: nonceBase64,
+      signature: signatureBase64,
+    }));
 
-    setChatLog((prev) => [...prev, { from: "me", text: messageText }]);
+    setChatLog((prev) => [...prev, { from: "me", text: messageText, verified: true }]);
     setMessageText("");
   }
 
   return (
-    <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: "500px" }}>
+    <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: "520px" }}>
       <h1>AI-Encrypted Communication System</h1>
 
       {!token && (
@@ -212,6 +290,11 @@ function App() {
         <>
           <p>Logged in as <strong>{myEmailRef.current}</strong></p>
           <p>{keyStatus}</p>
+          {myFingerprint && (
+            <p style={{ fontSize: "0.85rem", color: "#555" }}>
+              Your key fingerprint: <code>{myFingerprint}</code>
+            </p>
+          )}
 
           <h2>Contacts</h2>
           {users.length === 0 && <p>No other users with uploaded keys yet.</p>}
@@ -228,9 +311,22 @@ function App() {
           {recipientEmail && (
             <>
               <h3>Chat with {recipientEmail}</h3>
+              {recipientFingerprint && (
+                <p style={{ fontSize: "0.85rem", color: "#555" }}>
+                  Their key fingerprint: <code>{recipientFingerprint}</code><br />
+                  Compare this with {recipientEmail} out-of-band (in person or by call) to confirm you're not being intercepted.
+                </p>
+              )}
               <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
                 {chatLog.map((m, i) => (
-                  <p key={i}><strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}</p>
+                  <p key={i}>
+                    <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
+                    {m.from !== "me" && (
+                      <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
+                        {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
+                      </span>
+                    )}
+                  </p>
                 ))}
               </div>
               <form onSubmit={handleSendMessage}>

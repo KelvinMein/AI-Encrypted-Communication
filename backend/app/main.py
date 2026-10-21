@@ -49,6 +49,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     "from": email,
                     "ciphertext": data.get("ciphertext"),
                     "nonce": data.get("nonce"),
+                    "signature": data.get("signature"),
                 })
     except WebSocketDisconnect:
         active_connections.pop(email, None)
