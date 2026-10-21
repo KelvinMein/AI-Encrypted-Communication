@@ -1,6 +1,37 @@
 import { useState, useRef } from "react";
 
-const MAX_MESSAGE_AGE_MS = 60 * 1000; // messages older than 60 seconds are rejected
+const MAX_MESSAGE_AGE_MS = 60 * 1000; // live messages older than 60 seconds are rejected
+
+// ---- Persistent key storage (IndexedDB), one entry per email ----
+const DB_NAME = "secure-chat-keys";
+const STORE = "keys";
+
+function openKeyDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function loadStoredKeys(email) {
+  const db = await openKeyDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readonly").objectStore(STORE).get(email);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveStoredKeys(email, value) {
+  const db = await openKeyDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).put(value, email);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
 
 function App() {
   const [regEmail, setRegEmail] = useState("");
@@ -24,8 +55,8 @@ function App() {
   const signingKeyPairRef = useRef(null);
   const sharedKeysRef = useRef({});
   const verifyKeysRef = useRef({});
-  const seenIdsRef = useRef(new Set());   // message IDs already accepted
-  const lastSentRef = useRef(null);       // last payload sent, used by the replay test button
+  const seenIdsRef = useRef(new Set());
+  const lastSentRef = useRef(null);
   const wsRef = useRef(null);
   const myEmailRef = useRef("");
   const tokenRef = useRef("");
@@ -74,27 +105,36 @@ function App() {
     return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
   }
 
-  // The signature covers the message ID, timestamp, nonce and ciphertext together,
-  // so none of them can be changed without invalidating the signature.
+  // The signature covers the message ID, timestamp, nonce and ciphertext together.
   function buildSignedBytes(msgId, timestamp, nonceBase64, ciphertextBase64) {
     return new TextEncoder().encode(`${msgId}|${timestamp}|${nonceBase64}|${ciphertextBase64}`);
   }
 
   async function generateAndUploadKeys(jwtToken) {
-    setKeyStatus("Generating encryption keys...");
-    const pair = await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]
-    );
-    keyPairRef.current = pair;
-    const rawPublicKey = await crypto.subtle.exportKey("raw", pair.publicKey);
-    const publicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(rawPublicKey)));
+    // Reuse this user's saved keys if they exist, otherwise create and save new ones
+    let stored = await loadStoredKeys(myEmailRef.current);
 
-    setKeyStatus("Generating signing keys...");
-    const signingPair = await crypto.subtle.generateKey(
-      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]
-    );
-    signingKeyPairRef.current = signingPair;
-    const rawSigningPublicKey = await crypto.subtle.exportKey("raw", signingPair.publicKey);
+    if (stored) {
+      setKeyStatus("Loading your saved keys...");
+    } else {
+      setKeyStatus("Generating keys for the first time...");
+      // extractable=false: the private keys can be used but never read out by JavaScript
+      const ecdhPair = await crypto.subtle.generateKey(
+        { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey"]
+      );
+      const signingPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]
+      );
+      stored = { ecdhPair, signingPair };
+      await saveStoredKeys(myEmailRef.current, stored);
+    }
+
+    keyPairRef.current = stored.ecdhPair;
+    signingKeyPairRef.current = stored.signingPair;
+
+    const rawPublicKey = await crypto.subtle.exportKey("raw", stored.ecdhPair.publicKey);
+    const publicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(rawPublicKey)));
+    const rawSigningPublicKey = await crypto.subtle.exportKey("raw", stored.signingPair.publicKey);
     const signingPublicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(rawSigningPublicKey)));
 
     const fingerprint = await computeFingerprint(publicKeyBase64, signingPublicKeyBase64);
@@ -126,19 +166,21 @@ function App() {
     setUsers(data.filter((u) => u.email !== myEmailRef.current));
   }
 
-  async function getVerifyKey(email) {
+  // Fetches a person's current keys and prepares the shared AES key and verify key
+  async function getPeerKeys(email) {
     const response = await fetch("http://127.0.0.1:8000/users", {
       headers: { Authorization: `Bearer ${tokenRef.current}` },
       cache: "no-store",
     });
     const data = await response.json();
     const match = data.find((u) => u.email === email);
-    if (match && match.signing_key) {
-      const key = await importVerifyKey(match.signing_key);
-      verifyKeysRef.current[email] = key;
-      return key;
-    }
-    return null;
+    if (!match || !match.public_key || !match.signing_key) return null;
+
+    const sharedKey = await deriveSharedKey(match.public_key);
+    const verifyKey = await importVerifyKey(match.signing_key);
+    sharedKeysRef.current[email] = sharedKey;
+    verifyKeysRef.current[email] = verifyKey;
+    return { sharedKey, verifyKey, publicKey: match.public_key, signingKey: match.signing_key };
   }
 
   function connectWebSocket(jwtToken) {
@@ -146,8 +188,10 @@ function App() {
 
     ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
-      const sharedKey = sharedKeysRef.current[data.from];
-      if (!sharedKey) return;
+
+      // Works even if the sender isn't the contact currently selected
+      const peer = await getPeerKeys(data.from);
+      if (!peer) return;
 
       const nonce = Uint8Array.from(atob(data.nonce), (c) => c.charCodeAt(0));
       const ciphertextBytes = Uint8Array.from(atob(data.ciphertext), (c) => c.charCodeAt(0));
@@ -155,25 +199,27 @@ function App() {
       // 1. Verify the signature over id + timestamp + nonce + ciphertext
       let signatureValid = false;
       try {
-        const verifyKey = await getVerifyKey(data.from);
-        if (verifyKey && data.signature && data.msg_id && data.timestamp) {
+        if (data.signature && data.msg_id && data.timestamp) {
           const signatureBytes = Uint8Array.from(atob(data.signature), (c) => c.charCodeAt(0));
           const signedBytes = buildSignedBytes(data.msg_id, data.timestamp, data.nonce, data.ciphertext);
           signatureValid = await crypto.subtle.verify(
-            { name: "ECDSA", hash: "SHA-256" }, verifyKey, signatureBytes, signedBytes
+            { name: "ECDSA", hash: "SHA-256" }, peer.verifyKey, signatureBytes, signedBytes
           );
         }
       } catch (err) {
         signatureValid = false;
       }
 
-      // 2. Replay protection: only checked once the signature is valid,
-      //    so a forged message can't use up a real message ID.
+      // 2. Replay protection (only after the signature is valid).
+      //    Messages delivered from the server's offline store skip the age check,
+      //    since they were legitimately sent earlier, but are still checked for duplicates.
       if (signatureValid) {
-        const age = Math.abs(Date.now() - data.timestamp);
-        if (age > MAX_MESSAGE_AGE_MS) {
-          setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: message expired]", verified: false, rejected: true }]);
-          return;
+        if (!data.offline) {
+          const age = Math.abs(Date.now() - data.timestamp);
+          if (age > MAX_MESSAGE_AGE_MS) {
+            setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: message expired]", verified: false, rejected: true }]);
+            return;
+          }
         }
         if (seenIdsRef.current.has(data.msg_id)) {
           setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: replayed message]", verified: false, rejected: true }]);
@@ -184,9 +230,9 @@ function App() {
 
       // 3. Decrypt and display
       try {
-        const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, sharedKey, ciphertextBytes);
+        const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, peer.sharedKey, ciphertextBytes);
         const text = new TextDecoder().decode(decrypted);
-        setChatLog((prev) => [...prev, { from: data.from, text, verified: signatureValid }]);
+        setChatLog((prev) => [...prev, { from: data.from, text, verified: signatureValid, offline: !!data.offline }]);
       } catch (err) {
         setChatLog((prev) => [...prev, { from: data.from, text: "[Could not decrypt message]", verified: false }]);
       }
@@ -224,17 +270,9 @@ function App() {
     setRecipientEmail(email);
     setRecipientFingerprint("");
 
-    const response = await fetch("http://127.0.0.1:8000/users", {
-      headers: { Authorization: `Bearer ${tokenRef.current}` },
-      cache: "no-store",
-    });
-    const data = await response.json();
-    const match = data.find((u) => u.email === email);
-
-    if (match && match.public_key && match.signing_key) {
-      sharedKeysRef.current[email] = await deriveSharedKey(match.public_key);
-      verifyKeysRef.current[email] = await importVerifyKey(match.signing_key);
-      const fingerprint = await computeFingerprint(match.public_key, match.signing_key);
+    const peer = await getPeerKeys(email);
+    if (peer) {
+      const fingerprint = await computeFingerprint(peer.publicKey, peer.signingKey);
       setRecipientFingerprint(fingerprint);
     }
   }
@@ -287,6 +325,10 @@ function App() {
     setChatLog((prev) => [...prev, { from: "me", text: "[Replayed the last message for testing]", verified: true }]);
   }
 
+  function handleLogout() {
+    window.location.reload();
+  }
+
   return (
     <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: "520px" }}>
       <h1>AI-Encrypted Communication System</h1>
@@ -328,7 +370,10 @@ function App() {
 
       {token && (
         <>
-          <p>Logged in as <strong>{myEmailRef.current}</strong></p>
+          <p>
+            Logged in as <strong>{myEmailRef.current}</strong>{" "}
+            <button onClick={handleLogout} style={{ marginLeft: "0.5rem", fontSize: "0.8rem" }}>Log out</button>
+          </p>
           <p>{keyStatus}</p>
           {myFingerprint && (
             <p style={{ fontSize: "0.85rem", color: "#555" }}>
@@ -348,6 +393,24 @@ function App() {
             ))}
           </ul>
 
+          <h3>Messages</h3>
+          <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
+            {chatLog.length === 0 && <p style={{ color: "#888" }}>No messages yet.</p>}
+            {chatLog.map((m, i) => (
+              <p key={i}>
+                <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
+                {m.from !== "me" && !m.rejected && (
+                  <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
+                    {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
+                  </span>
+                )}
+                {m.offline && (
+                  <span style={{ fontSize: "0.75rem", color: "#555" }}> [received while you were offline]</span>
+                )}
+              </p>
+            ))}
+          </div>
+
           {recipientEmail && (
             <>
               <h3>Chat with {recipientEmail}</h3>
@@ -357,18 +420,6 @@ function App() {
                   Compare this with {recipientEmail} out-of-band (in person or by call) to confirm you're not being intercepted.
                 </p>
               )}
-              <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
-                {chatLog.map((m, i) => (
-                  <p key={i}>
-                    <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
-                    {m.from !== "me" && !m.rejected && (
-                      <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
-                        {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
-                      </span>
-                    )}
-                  </p>
-                ))}
-              </div>
               <form onSubmit={handleSendMessage}>
                 <input
                   type="text"
