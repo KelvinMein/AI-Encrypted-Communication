@@ -1,5 +1,7 @@
 import { useState, useRef } from "react";
 
+const MAX_MESSAGE_AGE_MS = 60 * 1000; // messages older than 60 seconds are rejected
+
 function App() {
   const [regEmail, setRegEmail] = useState("");
   const [regPassword, setRegPassword] = useState("");
@@ -22,6 +24,8 @@ function App() {
   const signingKeyPairRef = useRef(null);
   const sharedKeysRef = useRef({});
   const verifyKeysRef = useRef({});
+  const seenIdsRef = useRef(new Set());   // message IDs already accepted
+  const lastSentRef = useRef(null);       // last payload sent, used by the replay test button
   const wsRef = useRef(null);
   const myEmailRef = useRef("");
   const tokenRef = useRef("");
@@ -68,6 +72,12 @@ function App() {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(combined));
     const bytes = Array.from(new Uint8Array(digest)).slice(0, 8);
     return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
+  }
+
+  // The signature covers the message ID, timestamp, nonce and ciphertext together,
+  // so none of them can be changed without invalidating the signature.
+  function buildSignedBytes(msgId, timestamp, nonceBase64, ciphertextBase64) {
+    return new TextEncoder().encode(`${msgId}|${timestamp}|${nonceBase64}|${ciphertextBase64}`);
   }
 
   async function generateAndUploadKeys(jwtToken) {
@@ -142,26 +152,41 @@ function App() {
       const nonce = Uint8Array.from(atob(data.nonce), (c) => c.charCodeAt(0));
       const ciphertextBytes = Uint8Array.from(atob(data.ciphertext), (c) => c.charCodeAt(0));
 
+      // 1. Verify the signature over id + timestamp + nonce + ciphertext
       let signatureValid = false;
       try {
         const verifyKey = await getVerifyKey(data.from);
-        if (verifyKey && data.signature) {
+        if (verifyKey && data.signature && data.msg_id && data.timestamp) {
           const signatureBytes = Uint8Array.from(atob(data.signature), (c) => c.charCodeAt(0));
+          const signedBytes = buildSignedBytes(data.msg_id, data.timestamp, data.nonce, data.ciphertext);
           signatureValid = await crypto.subtle.verify(
-            { name: "ECDSA", hash: "SHA-256" }, verifyKey, signatureBytes, ciphertextBytes
+            { name: "ECDSA", hash: "SHA-256" }, verifyKey, signatureBytes, signedBytes
           );
         }
       } catch (err) {
         signatureValid = false;
       }
 
+      // 2. Replay protection: only checked once the signature is valid,
+      //    so a forged message can't use up a real message ID.
+      if (signatureValid) {
+        const age = Math.abs(Date.now() - data.timestamp);
+        if (age > MAX_MESSAGE_AGE_MS) {
+          setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: message expired]", verified: false, rejected: true }]);
+          return;
+        }
+        if (seenIdsRef.current.has(data.msg_id)) {
+          setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: replayed message]", verified: false, rejected: true }]);
+          return;
+        }
+        seenIdsRef.current.add(data.msg_id);
+      }
+
+      // 3. Decrypt and display
       try {
         const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, sharedKey, ciphertextBytes);
         const text = new TextDecoder().decode(decrypted);
-        setChatLog((prev) => [
-          ...prev,
-          { from: data.from, text, verified: signatureValid },
-        ]);
+        setChatLog((prev) => [...prev, { from: data.from, text, verified: signatureValid }]);
       } catch (err) {
         setChatLog((prev) => [...prev, { from: data.from, text: "[Could not decrypt message]", verified: false }]);
       }
@@ -226,25 +251,40 @@ function App() {
     const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, sharedKey, plaintext);
     const ciphertextBytes = new Uint8Array(ciphertext);
 
+    const nonceBase64 = btoa(String.fromCharCode(...nonce));
+    const ciphertextBase64 = btoa(String.fromCharCode(...ciphertextBytes));
+
+    const msgId = crypto.randomUUID();
+    const timestamp = Date.now();
+
     const signature = await crypto.subtle.sign(
       { name: "ECDSA", hash: "SHA-256" },
       signingKeyPairRef.current.privateKey,
-      ciphertextBytes
+      buildSignedBytes(msgId, timestamp, nonceBase64, ciphertextBase64)
     );
-
-    const nonceBase64 = btoa(String.fromCharCode(...nonce));
-    const ciphertextBase64 = btoa(String.fromCharCode(...ciphertextBytes));
     const signatureBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
 
-    wsRef.current.send(JSON.stringify({
+    const payload = {
       to: recipientEmail,
       ciphertext: ciphertextBase64,
       nonce: nonceBase64,
       signature: signatureBase64,
-    }));
+      msg_id: msgId,
+      timestamp: timestamp,
+    };
+
+    wsRef.current.send(JSON.stringify(payload));
+    lastSentRef.current = payload;
 
     setChatLog((prev) => [...prev, { from: "me", text: messageText, verified: true }]);
     setMessageText("");
+  }
+
+  // Test button: re-sends the exact same signed message, simulating an attacker replaying it.
+  function handleReplayLast() {
+    if (!lastSentRef.current || !wsRef.current) return;
+    wsRef.current.send(JSON.stringify(lastSentRef.current));
+    setChatLog((prev) => [...prev, { from: "me", text: "[Replayed the last message for testing]", verified: true }]);
   }
 
   return (
@@ -321,7 +361,7 @@ function App() {
                 {chatLog.map((m, i) => (
                   <p key={i}>
                     <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
-                    {m.from !== "me" && (
+                    {m.from !== "me" && !m.rejected && (
                       <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
                         {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
                       </span>
@@ -339,6 +379,9 @@ function App() {
                 />
                 <button type="submit" style={{ padding: "0.5rem 1rem" }}>Send</button>
               </form>
+              <button onClick={handleReplayLast} style={{ marginTop: "1rem", padding: "0.4rem 0.8rem", fontSize: "0.8rem" }}>
+                Replay last sent message (test)
+              </button>
             </>
           )}
         </>
