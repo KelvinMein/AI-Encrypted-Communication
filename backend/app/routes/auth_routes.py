@@ -7,12 +7,16 @@ from jose import jwt, JWTError
 from app.database import get_db
 from app.models.user import User
 from app.models.metadata_log import MetadataLog
+from app.models.anomaly_flag import AnomalyFlag
 from app.schemas import UserCreate, UserOut, UserLogin, Token, PublicKeyUpload
 from app.auth import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
 from app.logger import log_event
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Accounts allowed to see logs and anomaly flags. Hard-coded for now.
+ADMIN_EMAILS = {"kelvin@example.com"}
 
 
 def get_client_ip(request: Request):
@@ -33,6 +37,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if user is None:
         raise credentials_exception
     return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)):
+    if current_user.email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return current_user
 
 
 @router.post("/register", response_model=UserOut)
@@ -100,11 +110,9 @@ def list_users(db: Session = Depends(get_db)):
 @router.get("/logs")
 def list_logs(
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    # Any logged-in user can read this for now; it will be restricted to an
-    # administrator role when the admin dashboard is built.
     rows = (
         db.query(MetadataLog)
         .order_by(MetadataLog.id.desc())
@@ -124,3 +132,43 @@ def list_logs(
         }
         for r in rows
     ]
+
+
+@router.get("/flags")
+def list_flags(
+    limit: int = 100,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(AnomalyFlag)
+        .order_by(AnomalyFlag.id.desc())
+        .limit(min(limit, 500))
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "subject": r.subject,
+            "email": r.email,
+            "anomaly_score": r.anomaly_score,
+            "reason": r.reason,
+            "reviewed": r.reviewed,
+            "flagged_at": r.flagged_at.isoformat() if r.flagged_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/flags/{flag_id}/review")
+def review_flag(
+    flag_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    flag = db.query(AnomalyFlag).filter(AnomalyFlag.id == flag_id).first()
+    if flag is None:
+        raise HTTPException(status_code=404, detail="Flag not found")
+    flag.reviewed = True
+    db.commit()
+    return {"message": "Flag marked as reviewed"}
