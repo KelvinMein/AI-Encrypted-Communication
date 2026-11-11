@@ -1,6 +1,7 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const MAX_MESSAGE_AGE_MS = 60 * 1000; // live messages older than 60 seconds are rejected
+const ADMIN_EMAILS = ["kelvin@example.com"]; // cosmetic only: the server enforces admin access
 
 // ---- Persistent key storage (IndexedDB), one entry per email ----
 const DB_NAME = "secure-chat-keys";
@@ -51,6 +52,11 @@ function App() {
   const [messageText, setMessageText] = useState("");
   const [chatLog, setChatLog] = useState([]);
 
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [flags, setFlags] = useState([]);
+  const [flagsError, setFlagsError] = useState("");
+  const [showReviewed, setShowReviewed] = useState(false);
+
   const keyPairRef = useRef(null);
   const signingKeyPairRef = useRef(null);
   const sharedKeysRef = useRef({});
@@ -60,6 +66,39 @@ function App() {
   const wsRef = useRef(null);
   const myEmailRef = useRef("");
   const tokenRef = useRef("");
+
+  // ---- Admin: load and refresh anomaly flags ----
+  async function loadFlags() {
+    try {
+      const response = await fetch("http://127.0.0.1:8000/flags?limit=100", {
+        headers: { Authorization: `Bearer ${tokenRef.current}` },
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        setFlagsError(response.status === 403 ? "Administrator access required." : "Could not load flags.");
+        return;
+      }
+      setFlagsError("");
+      setFlags(await response.json());
+    } catch (err) {
+      setFlagsError("Could not reach the server.");
+    }
+  }
+
+  async function markReviewed(flagId) {
+    await fetch(`http://127.0.0.1:8000/flags/${flagId}/review`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${tokenRef.current}` },
+    });
+    loadFlags();
+  }
+
+  useEffect(() => {
+    if (!isAdmin || !token) return;
+    loadFlags();
+    const timer = setInterval(loadFlags, 5000);
+    return () => clearInterval(timer);
+  }, [isAdmin, token]);
 
   async function handleRegister(e) {
     e.preventDefault();
@@ -256,6 +295,7 @@ function App() {
         setToken(data.access_token);
         tokenRef.current = data.access_token;
         myEmailRef.current = loginEmail;
+        setIsAdmin(ADMIN_EMAILS.includes(loginEmail));
         setLoginResult("Login successful.");
         await generateAndUploadKeys(data.access_token);
       } else {
@@ -329,12 +369,15 @@ function App() {
     window.location.reload();
   }
 
+  const visibleFlags = flags.filter((f) => showReviewed || !f.reviewed);
+  const unreviewedCount = flags.filter((f) => !f.reviewed).length;
+
   return (
-    <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: "520px" }}>
+    <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: isAdmin ? "900px" : "520px" }}>
       <h1>AI-Encrypted Communication System</h1>
 
       {!token && (
-        <>
+        <div style={{ maxWidth: "520px" }}>
           <h2>Register</h2>
           <form onSubmit={handleRegister}>
             <div style={{ marginBottom: "1rem" }}>
@@ -365,13 +408,13 @@ function App() {
           </form>
           <p>{loginResult}</p>
           <p>{keyStatus}</p>
-        </>
+        </div>
       )}
 
       {token && (
         <>
           <p>
-            Logged in as <strong>{myEmailRef.current}</strong>{" "}
+            Logged in as <strong>{myEmailRef.current}</strong>{isAdmin && " (administrator)"}{" "}
             <button onClick={handleLogout} style={{ marginLeft: "0.5rem", fontSize: "0.8rem" }}>Log out</button>
           </p>
           <p>{keyStatus}</p>
@@ -381,60 +424,113 @@ function App() {
             </p>
           )}
 
-          <h2>Contacts</h2>
-          {users.length === 0 && <p>No other users with uploaded keys yet.</p>}
-          <ul>
-            {users.map((u) => (
-              <li key={u.email}>
-                <button onClick={() => handleSelectRecipient(u.email)} style={{ fontWeight: recipientEmail === u.email ? "bold" : "normal" }}>
-                  {u.email}
-                </button>
-              </li>
-            ))}
-          </ul>
-
-          <h3>Messages</h3>
-          <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
-            {chatLog.length === 0 && <p style={{ color: "#888" }}>No messages yet.</p>}
-            {chatLog.map((m, i) => (
-              <p key={i}>
-                <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
-                {m.from !== "me" && !m.rejected && (
-                  <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
-                    {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
-                  </span>
-                )}
-                {m.offline && (
-                  <span style={{ fontSize: "0.75rem", color: "#555" }}> [received while you were offline]</span>
-                )}
-              </p>
-            ))}
-          </div>
-
-          {recipientEmail && (
-            <>
-              <h3>Chat with {recipientEmail}</h3>
-              {recipientFingerprint && (
-                <p style={{ fontSize: "0.85rem", color: "#555" }}>
-                  Their key fingerprint: <code>{recipientFingerprint}</code><br />
-                  Compare this with {recipientEmail} out-of-band (in person or by call) to confirm you're not being intercepted.
-                </p>
+          {isAdmin && (
+            <div style={{ border: "2px solid #b00020", borderRadius: "6px", padding: "1rem", marginBottom: "2rem" }}>
+              <h2 style={{ marginTop: 0 }}>
+                Security Alerts{" "}
+                <span style={{ fontSize: "0.9rem", color: unreviewedCount ? "#b00020" : "#2e7d32" }}>
+                  ({unreviewedCount} unreviewed)
+                </span>
+              </h2>
+              <label style={{ fontSize: "0.85rem" }}>
+                <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />{" "}
+                Show reviewed alerts
+              </label>
+              {flagsError && <p style={{ color: "#b00020" }}>{flagsError}</p>}
+              {!flagsError && visibleFlags.length === 0 && (
+                <p style={{ color: "#555" }}>No alerts to show. The list refreshes every 5 seconds.</p>
               )}
-              <form onSubmit={handleSendMessage}>
-                <input
-                  type="text"
-                  value={messageText}
-                  onChange={(e) => setMessageText(e.target.value)}
-                  placeholder="Type an encrypted message..."
-                  style={{ width: "80%", padding: "0.5rem" }}
-                />
-                <button type="submit" style={{ padding: "0.5rem 1rem" }}>Send</button>
-              </form>
-              <button onClick={handleReplayLast} style={{ marginTop: "1rem", padding: "0.4rem 0.8rem", fontSize: "0.8rem" }}>
-                Replay last sent message (test)
-              </button>
-            </>
+              {visibleFlags.length > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem", marginTop: "0.5rem" }}>
+                    <thead>
+                      <tr style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>
+                        <th style={{ padding: "0.4rem" }}>Time</th>
+                        <th style={{ padding: "0.4rem" }}>Account</th>
+                        <th style={{ padding: "0.4rem" }}>What was detected</th>
+                        <th style={{ padding: "0.4rem" }}>Score</th>
+                        <th style={{ padding: "0.4rem" }}></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visibleFlags.map((f) => (
+                        <tr key={f.id} style={{ borderBottom: "1px solid #eee", opacity: f.reviewed ? 0.5 : 1 }}>
+                          <td style={{ padding: "0.4rem", whiteSpace: "nowrap" }}>
+                            {f.flagged_at ? new Date(f.flagged_at).toLocaleTimeString() : ""}
+                          </td>
+                          <td style={{ padding: "0.4rem" }}>{f.subject}</td>
+                          <td style={{ padding: "0.4rem" }}>{f.reason}</td>
+                          <td style={{ padding: "0.4rem" }}>{f.anomaly_score.toFixed(2)}</td>
+                          <td style={{ padding: "0.4rem" }}>
+                            {f.reviewed ? "Reviewed" : (
+                              <button onClick={() => markReviewed(f.id)} style={{ fontSize: "0.75rem" }}>Mark reviewed</button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           )}
+
+          <div style={{ maxWidth: "520px" }}>
+            <h2>Contacts</h2>
+            {users.length === 0 && <p>No other users with uploaded keys yet.</p>}
+            <ul>
+              {users.map((u) => (
+                <li key={u.email}>
+                  <button onClick={() => handleSelectRecipient(u.email)} style={{ fontWeight: recipientEmail === u.email ? "bold" : "normal" }}>
+                    {u.email}
+                  </button>
+                </li>
+              ))}
+            </ul>
+
+            <h3>Messages</h3>
+            <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
+              {chatLog.length === 0 && <p style={{ color: "#888" }}>No messages yet.</p>}
+              {chatLog.map((m, i) => (
+                <p key={i}>
+                  <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
+                  {m.from !== "me" && !m.rejected && (
+                    <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
+                      {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
+                    </span>
+                  )}
+                  {m.offline && (
+                    <span style={{ fontSize: "0.75rem", color: "#555" }}> [received while you were offline]</span>
+                  )}
+                </p>
+              ))}
+            </div>
+
+            {recipientEmail && (
+              <>
+                <h3>Chat with {recipientEmail}</h3>
+                {recipientFingerprint && (
+                  <p style={{ fontSize: "0.85rem", color: "#555" }}>
+                    Their key fingerprint: <code>{recipientFingerprint}</code><br />
+                    Compare this with {recipientEmail} out-of-band (in person or by call) to confirm you're not being intercepted.
+                  </p>
+                )}
+                <form onSubmit={handleSendMessage}>
+                  <input
+                    type="text"
+                    value={messageText}
+                    onChange={(e) => setMessageText(e.target.value)}
+                    placeholder="Type an encrypted message..."
+                    style={{ width: "80%", padding: "0.5rem" }}
+                  />
+                  <button type="submit" style={{ padding: "0.5rem 1rem" }}>Send</button>
+                </form>
+                <button onClick={handleReplayLast} style={{ marginTop: "1rem", padding: "0.4rem 0.8rem", fontSize: "0.8rem" }}>
+                  Replay last sent message (test)
+                </button>
+              </>
+            )}
+          </div>
         </>
       )}
     </div>
