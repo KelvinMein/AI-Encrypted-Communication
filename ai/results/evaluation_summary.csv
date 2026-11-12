@@ -1,0 +1,5 @@
+detector,attack_runs_detected,attack_runs,detection_rate,detection_ci_low,detection_ci_high,normal_sessions_flagged,normal_sessions,false_alarm_rate,false_alarm_ci_low,false_alarm_ci_high,normal_events_flagged_rate,event_precision,event_recall,event_f1
+Hybrid (deployed),24,24,1.0,0.862,1.0,10,144,0.069,0.038,0.123,0.0066,0.993,0.845,0.913
+Isolation Forest only,6,24,0.25,0.12,0.449,10,144,0.069,0.038,0.123,0.0066,0.946,0.11,0.197
+Magnitude limits only,24,24,1.0,0.862,1.0,0,144,0.0,0.0,0.026,0.0,1.0,0.833,0.909
+Simple rule,24,24,1.0,0.862,1.0,0,144,0.0,0.0,0.026,0.0,1.0,0.784,0.879
