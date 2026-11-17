@@ -1,0 +1,25 @@
+scenario,detector,runs_detected,runs,detection_rate,ci_low,ci_high,median_seconds_to_first_flag
+brute_force,Hybrid (deployed),6,6,1.0,0.61,1.0,1.53
+brute_force,Isolation Forest only,0,6,0.0,0.0,0.39,
+brute_force,Magnitude limits only,6,6,1.0,0.61,1.0,1.53
+brute_force,Simple rule,6,6,1.0,0.61,1.0,3.05
+credential_stuffing,Hybrid (deployed),6,6,1.0,0.61,1.0,0.17
+credential_stuffing,Isolation Forest only,6,6,1.0,0.61,1.0,0.17
+credential_stuffing,Magnitude limits only,6,6,1.0,0.61,1.0,0.64
+credential_stuffing,Simple rule,6,6,1.0,0.61,1.0,1.4
+flooding,Hybrid (deployed),6,6,1.0,0.61,1.0,0.96
+flooding,Isolation Forest only,0,6,0.0,0.0,0.39,
+flooding,Magnitude limits only,6,6,1.0,0.61,1.0,0.96
+flooding,Simple rule,6,6,1.0,0.61,1.0,1.01
+replay_burst,Hybrid (deployed),6,6,1.0,0.61,1.0,1.57
+replay_burst,Isolation Forest only,0,6,0.0,0.0,0.39,
+replay_burst,Magnitude limits only,6,6,1.0,0.61,1.0,1.57
+replay_burst,Simple rule,6,6,1.0,0.61,1.0,1.77
+large_payload,Hybrid (deployed),0,6,0.0,0.0,0.39,
+large_payload,Isolation Forest only,0,6,0.0,0.0,0.39,
+large_payload,Magnitude limits only,0,6,0.0,0.0,0.39,
+large_payload,Simple rule,0,6,0.0,0.0,0.39,
+fan_out,Hybrid (deployed),0,6,0.0,0.0,0.39,
+fan_out,Isolation Forest only,0,6,0.0,0.0,0.39,
+fan_out,Magnitude limits only,0,6,0.0,0.0,0.39,
+fan_out,Simple rule,0,6,0.0,0.0,0.39,

@@ -2,6 +2,9 @@
 
 Writes ai/data/scenario_labels.csv, one row per scenario run, with the start and end time
 and a label (normal / attack / setup). Week 8 joins these time windows with metadata_logs.
+
+Standard run:   python ai\\simulator.py --rounds 5 --speed 0.5
+Extra attacks:  python ai\\simulator.py --rounds 6 --speed 0.5 --extra-only
 """
 import argparse
 import base64
@@ -26,7 +29,8 @@ PASSWORD = "SimPass123!"
 NORMAL_USERS = [f"sim.user{i}@example.com" for i in range(1, 7)]
 ATTACKER = "sim.attacker@example.com"
 SINK = "sim.sink@example.com"  # receives attack traffic and never connects
-ALL_ACCOUNTS = NORMAL_USERS + [ATTACKER, SINK]
+TARGETS = [f"sim.target{i}@example.com" for i in range(1, 13)]  # recipients for the fan-out attack
+ALL_ACCOUNTS = NORMAL_USERS + [ATTACKER, SINK] + TARGETS
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 LABEL_FILE = os.path.join(DATA_DIR, "scenario_labels.csv")
@@ -51,10 +55,11 @@ def fake_public_key():
     return base64.b64encode(raw).decode()
 
 
-def make_payload(to_email):
+def make_payload(to_email, size=None):
+    n = size if size is not None else random.randint(20, 200)
     return {
         "to": to_email,
-        "ciphertext": b64_random(random.randint(20, 200)),
+        "ciphertext": b64_random(n),
         "nonce": b64_random(12),
         "signature": b64_random(64),
         "msg_id": str(uuid.uuid4()),
@@ -201,6 +206,28 @@ def run_credential_stuffing():
     return emails
 
 
+def run_large_payload():
+    """10 very large messages at a moderate pace: stays under every message-count limit."""
+    token = login(ATTACKER, PASSWORD)
+    upload_keys(token)
+    with connect(f"{WS_BASE}/ws/{token}") as ws:
+        for _ in range(10):
+            ws.send(json.dumps(make_payload(SINK, size=random.randint(4000, 12000))))
+            time.sleep(random.uniform(0.6, 1.0))
+    return [ATTACKER]
+
+
+def run_fan_out():
+    """One normal-sized message to each of 12 different accounts: stays under every count limit."""
+    token = login(ATTACKER, PASSWORD)
+    upload_keys(token)
+    with connect(f"{WS_BASE}/ws/{token}") as ws:
+        for target in TARGETS:
+            ws.send(json.dumps(make_payload(target)))
+            time.sleep(random.uniform(0.4, 0.7))
+    return [ATTACKER]
+
+
 # ---------- main ----------
 
 def main():
@@ -208,6 +235,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=3, help="how many full rounds to run")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="multiplier for pauses in normal traffic (smaller = faster)")
+    parser.add_argument("--extra-only", action="store_true",
+                        help="run only the two extra attacks (large_payload, fan_out) between normal traffic")
     args = parser.parse_args()
 
     try:
@@ -217,16 +246,25 @@ def main():
         return
 
     run_normal = make_run_normal(args.speed)
-    schedule = [
-        ("normal", "normal", run_normal),
-        ("brute_force", "attack", run_brute_force),
-        ("normal", "normal", run_normal),
-        ("flooding", "attack", run_flooding),
-        ("normal", "normal", run_normal),
-        ("replay_burst", "attack", run_replay_burst),
-        ("normal", "normal", run_normal),
-        ("credential_stuffing", "attack", run_credential_stuffing),
-    ]
+
+    if args.extra_only:
+        schedule = [
+            ("normal", "normal", run_normal),
+            ("large_payload", "attack", run_large_payload),
+            ("normal", "normal", run_normal),
+            ("fan_out", "attack", run_fan_out),
+        ]
+    else:
+        schedule = [
+            ("normal", "normal", run_normal),
+            ("brute_force", "attack", run_brute_force),
+            ("normal", "normal", run_normal),
+            ("flooding", "attack", run_flooding),
+            ("normal", "normal", run_normal),
+            ("replay_burst", "attack", run_replay_burst),
+            ("normal", "normal", run_normal),
+            ("credential_stuffing", "attack", run_credential_stuffing),
+        ]
 
     timed("setup", "setup", run_setup)
     for r in range(1, args.rounds + 1):

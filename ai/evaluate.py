@@ -31,7 +31,11 @@ MODEL_FILE = os.path.join(ROOT, "ai", "models", "hybrid_live_model.joblib")
 RESULTS_DIR = os.path.join(ROOT, "ai", "results")
 FIGURE_DIR = os.path.join(ROOT, "docs", "figures")
 
-SCENARIOS = ["brute_force", "credential_stuffing", "flooding", "replay_burst"]
+# Attack groups: the original four are threshold-style, the new two sit outside every count limit
+GROUPS = [
+    ("original", ["brute_force", "credential_stuffing", "flooding", "replay_burst"]),
+    ("new", ["large_payload", "fan_out"]),
+]
 DET = [
     ("Hybrid (deployed)", "hybrid"),
     ("Isolation Forest only", "iforest"),
@@ -97,6 +101,7 @@ bundle = joblib.load(MODEL_FILE)
 model, FEATURES, limits = bundle["model"], bundle["features"], bundle["limits"]
 
 feat["iforest"] = model.predict(feat[FEATURES]) == -1
+feat["score"] = model.score_samples(feat[FEATURES])
 feat["magnitude"] = False
 for f, lim in limits.items():
     feat["magnitude"] = feat["magnitude"] | (feat[f] > lim)
@@ -110,15 +115,20 @@ feat["rule"] = (
 attack = feat[feat["label"] == "attack"]
 normal = feat[feat["label"] == "normal"]
 
+# Only keep the scenarios that are actually present in the data
+present = set(attack["scenario"])
+GROUPS = [(g, [s for s in ss if s in present]) for g, ss in GROUPS]
+GROUPS = [(g, ss) for g, ss in GROUPS if ss]
+SCENARIOS = [s for _, ss in GROUPS for s in ss]
+
 print("HELD-OUT DATA")
 print(f"  Events read from the database since {START}: {len(events)}")
 print(f"  Events inside a normal or attack window:      {len(labelled)}  (saved to ai/data/heldout_events.csv)")
 print(f"  Scored events:                                {len(feat)}")
-print(f"  Attack runs per scenario: " + ", ".join(
+print("  Attack runs per scenario: " + ", ".join(
     f"{s} {attack[attack['scenario'] == s]['run'].nunique()}" for s in SCENARIOS))
 print(f"  Normal runs: {normal['run'].nunique()}   Normal sessions (run x user): "
       f"{len(normal.groupby(['run', 'email']))}")
-print("  (expect 6 runs of each attack, 24 normal runs, about 144 normal sessions)")
 print()
 
 # ---------- 1. Attack runs detected ----------
@@ -132,15 +142,22 @@ print("1. ATTACK RUNS DETECTED (at least one flag during the run)")
 print(f"{'Scenario':<22}" + "".join(f"{name:>24}" for name, _ in DET))
 for s in SCENARIOS:
     print(f"{s:<22}" + "".join(f"{str(det[(s, c)][0]) + ' of ' + str(det[(s, c)][1]):>24}" for _, c in DET))
-print(f"{'OVERALL (95% CI)':<22}", end="")
+for gname, ss in GROUPS:
+    line = f"{'ALL ' + gname + ' (CI)':<22}"
+    for _, c in DET:
+        k = sum(det[(s, c)][0] for s in ss)
+        n = sum(det[(s, c)][1] for s in ss)
+        lo, hi = wilson(k, n)
+        line += f"{f'{k}/{n} ({lo:.2f}-{hi:.2f})':>24}"
+    print(line)
+print()
+
 overall = {}
 for _, c in DET:
     k = sum(det[(s, c)][0] for s in SCENARIOS)
     n = sum(det[(s, c)][1] for s in SCENARIOS)
     lo, hi = wilson(k, n)
     overall[c] = (k, n, lo, hi)
-    print(f"{f'{k}/{n} ({lo:.2f}-{hi:.2f})':>24}", end="")
-print("\n")
 
 # ---------- 2. False alarms on normal sessions ----------
 print("2. FALSE ALARMS: normal sessions with at least one flag")
@@ -203,9 +220,16 @@ for s in SCENARIOS:
     print(line)
 print()
 
+# ---------- 5. Isolation Forest scores ----------
+print(f"5. ISOLATION FOREST SCORES (lower = more anomalous; an event is flagged below {model.offset_:.3f})")
+for s in ["normal"] + SCENARIOS:
+    sub = feat[feat["scenario"] == s]["score"]
+    print(f"  {s:<22} min {sub.min():.3f}   mean {sub.mean():.3f}   max {sub.max():.3f}")
+print()
+
 # ---------- chart ----------
 os.makedirs(FIGURE_DIR, exist_ok=True)
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
 
 x = np.arange(len(SCENARIOS))
 w = 0.2
@@ -213,11 +237,11 @@ for j, (name, c) in enumerate(DET):
     rates = [det[(s, c)][0] / det[(s, c)][1] for s in SCENARIOS]
     axes[0].bar(x + (j - 1.5) * w, rates, w, label=name)
 axes[0].set_xticks(x)
-axes[0].set_xticklabels([s.replace("_", " ") for s in SCENARIOS])
+axes[0].set_xticklabels([s.replace("_", " ") for s in SCENARIOS], rotation=15, ha="right")
 axes[0].set_ylim(0, 1.05)
 axes[0].set_ylabel("Share of attack runs detected")
 axes[0].set_title("Detection by attack type (held-out data)")
-axes[0].legend(fontsize=8, loc="lower left")
+axes[0].legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=4)
 
 names = [n for n, _ in DET]
 rates = np.array([fa[c][0] / fa[c][1] for _, c in DET])
@@ -233,10 +257,10 @@ axes[1].set_title("False alarms (bars show 95% confidence intervals)")
 
 plt.tight_layout()
 fig_path = os.path.join(FIGURE_DIR, "evaluation.png")
-plt.savefig(fig_path, dpi=150)
+plt.savefig(fig_path, dpi=150, bbox_inches="tight")
 print("Chart saved to", fig_path)
 
-# ---------- summary file ----------
+# ---------- summary files ----------
 os.makedirs(RESULTS_DIR, exist_ok=True)
 rows = []
 for name, c in DET:
@@ -254,4 +278,19 @@ for name, c in DET:
     })
 summary_path = os.path.join(RESULTS_DIR, "evaluation_summary.csv")
 pd.DataFrame(rows).to_csv(summary_path, index=False)
-print("Summary saved to", summary_path)
+
+rows2 = []
+for s in SCENARIOS:
+    for name, c in DET:
+        k, n = det[(s, c)]
+        lo, hi = wilson(k, n)
+        secs, missed = delays[c][s]
+        rows2.append({
+            "scenario": s, "detector": name,
+            "runs_detected": k, "runs": n,
+            "detection_rate": round(k / n, 3), "ci_low": round(lo, 3), "ci_high": round(hi, 3),
+            "median_seconds_to_first_flag": round(float(np.median(secs)), 2) if secs else "",
+        })
+by_scenario_path = os.path.join(RESULTS_DIR, "evaluation_by_scenario.csv")
+pd.DataFrame(rows2).to_csv(by_scenario_path, index=False)
+print("Summaries saved to", summary_path, "and", by_scenario_path)
