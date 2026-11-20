@@ -1,4 +1,7 @@
 import { useState, useRef, useEffect } from "react";
+import AuthScreen from "./components/AuthScreen";
+import Chat, { Avatar } from "./components/Chat";
+import AlertsPanel from "./components/AlertsPanel";
 
 const MAX_MESSAGE_AGE_MS = 60 * 1000; // live messages older than 60 seconds are rejected
 const ADMIN_EMAILS = ["kelvin@example.com"]; // cosmetic only: the server enforces admin access
@@ -35,12 +38,7 @@ async function saveStoredKeys(email, value) {
 }
 
 function App() {
-  const [regEmail, setRegEmail] = useState("");
-  const [regPassword, setRegPassword] = useState("");
   const [regResult, setRegResult] = useState("");
-
-  const [loginEmail, setLoginEmail] = useState("");
-  const [loginPassword, setLoginPassword] = useState("");
   const [loginResult, setLoginResult] = useState("");
   const [token, setToken] = useState("");
   const [keyStatus, setKeyStatus] = useState("");
@@ -52,6 +50,7 @@ function App() {
   const [messageText, setMessageText] = useState("");
   const [chatLog, setChatLog] = useState([]);
 
+  const [view, setView] = useState("chat");
   const [isAdmin, setIsAdmin] = useState(false);
   const [flags, setFlags] = useState([]);
   const [flagsError, setFlagsError] = useState("");
@@ -100,17 +99,16 @@ function App() {
     return () => clearInterval(timer);
   }, [isAdmin, token]);
 
-  async function handleRegister(e) {
-    e.preventDefault();
-    setRegResult("Registering...");
+  async function handleRegister(email, password) {
+    setRegResult("Creating account...");
     try {
       const response = await fetch("http://127.0.0.1:8000/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: regEmail, password: regPassword }),
+        body: JSON.stringify({ email, password }),
       });
       const data = await response.json();
-      setRegResult(response.ok ? `Registered successfully: ${data.email}` : `Error: ${data.detail}`);
+      setRegResult(response.ok ? `Account created for ${data.email}. You can log in now.` : `Error: ${data.detail}`);
     } catch (err) {
       setRegResult(`Network error: ${err.message}`);
     }
@@ -202,7 +200,8 @@ function App() {
       cache: "no-store",
     });
     const data = await response.json();
-    setUsers(data.filter((u) => u.email !== myEmailRef.current));
+    // Hide yourself and the simulator's test accounts from the contacts list
+    setUsers(data.filter((u) => u.email !== myEmailRef.current && !u.email.startsWith("sim.")));
   }
 
   // Fetches a person's current keys and prepares the shared AES key and verify key
@@ -256,12 +255,18 @@ function App() {
         if (!data.offline) {
           const age = Math.abs(Date.now() - data.timestamp);
           if (age > MAX_MESSAGE_AGE_MS) {
-            setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: message expired]", verified: false, rejected: true }]);
+            setChatLog((prev) => [
+              ...prev,
+              { peer: data.from, from: data.from, text: "Rejected: message expired", rejected: true, time: Date.now() },
+            ]);
             return;
           }
         }
         if (seenIdsRef.current.has(data.msg_id)) {
-          setChatLog((prev) => [...prev, { from: data.from, text: "[Rejected: replayed message]", verified: false, rejected: true }]);
+          setChatLog((prev) => [
+            ...prev,
+            { peer: data.from, from: data.from, text: "Rejected: replayed message", rejected: true, time: Date.now() },
+          ]);
           return;
         }
         seenIdsRef.current.add(data.msg_id);
@@ -271,31 +276,36 @@ function App() {
       try {
         const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, peer.sharedKey, ciphertextBytes);
         const text = new TextDecoder().decode(decrypted);
-        setChatLog((prev) => [...prev, { from: data.from, text, verified: signatureValid, offline: !!data.offline }]);
+        setChatLog((prev) => [
+          ...prev,
+          { peer: data.from, from: data.from, text, verified: signatureValid, offline: !!data.offline, time: data.timestamp },
+        ]);
       } catch (err) {
-        setChatLog((prev) => [...prev, { from: data.from, text: "[Could not decrypt message]", verified: false }]);
+        setChatLog((prev) => [
+          ...prev,
+          { peer: data.from, from: data.from, text: "Could not decrypt message", rejected: true, time: Date.now() },
+        ]);
       }
     };
 
     wsRef.current = ws;
   }
 
-  async function handleLogin(e) {
-    e.preventDefault();
+  async function handleLogin(email, password) {
     setLoginResult("Logging in...");
     try {
       const response = await fetch("http://127.0.0.1:8000/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+        body: JSON.stringify({ email, password }),
       });
       const data = await response.json();
 
       if (response.ok) {
         setToken(data.access_token);
         tokenRef.current = data.access_token;
-        myEmailRef.current = loginEmail;
-        setIsAdmin(ADMIN_EMAILS.includes(loginEmail));
+        myEmailRef.current = email;
+        setIsAdmin(ADMIN_EMAILS.includes(email));
         setLoginResult("Login successful.");
         await generateAndUploadKeys(data.access_token);
       } else {
@@ -319,7 +329,7 @@ function App() {
 
   async function handleSendMessage(e) {
     e.preventDefault();
-    if (!recipientEmail || !messageText || !wsRef.current) return;
+    if (!recipientEmail || !messageText.trim() || !wsRef.current) return;
 
     const sharedKey = sharedKeysRef.current[recipientEmail];
     if (!sharedKey) return;
@@ -354,7 +364,10 @@ function App() {
     wsRef.current.send(JSON.stringify(payload));
     lastSentRef.current = payload;
 
-    setChatLog((prev) => [...prev, { from: "me", text: messageText, verified: true }]);
+    setChatLog((prev) => [
+      ...prev,
+      { peer: recipientEmail, from: "me", text: messageText, verified: true, time: timestamp },
+    ]);
     setMessageText("");
   }
 
@@ -362,177 +375,131 @@ function App() {
   function handleReplayLast() {
     if (!lastSentRef.current || !wsRef.current) return;
     wsRef.current.send(JSON.stringify(lastSentRef.current));
-    setChatLog((prev) => [...prev, { from: "me", text: "[Replayed the last message for testing]", verified: true }]);
+    setChatLog((prev) => [
+      ...prev,
+      {
+        peer: lastSentRef.current.to,
+        from: "me",
+        text: "You re-sent your last message to test replay protection",
+        system: true,
+        time: Date.now(),
+      },
+    ]);
   }
 
   function handleLogout() {
     window.location.reload();
   }
 
-  const visibleFlags = flags.filter((f) => showReviewed || !f.reviewed);
+  // ---------- Logged-out view ----------
+  if (!token) {
+    return (
+      <AuthScreen
+        onRegister={handleRegister}
+        onLogin={handleLogin}
+        registerResult={regResult}
+        loginResult={loginResult}
+        keyStatus={keyStatus}
+      />
+    );
+  }
+
+  // ---------- Logged-in view ----------
   const unreviewedCount = flags.filter((f) => !f.reviewed).length;
+  const conversation = chatLog.filter((m) => m.peer === recipientEmail);
+  const keysReady = keyStatus.startsWith("Encryption and signing keys ready");
 
   return (
-    <div style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: isAdmin ? "900px" : "520px" }}>
-      <h1>AI-Encrypted Communication System</h1>
-
-      {!token && (
-        <div style={{ maxWidth: "520px" }}>
-          <h2>Register</h2>
-          <form onSubmit={handleRegister}>
-            <div style={{ marginBottom: "1rem" }}>
-              <label>Email</label><br />
-              <input type="email" value={regEmail} onChange={(e) => setRegEmail(e.target.value)} required style={{ width: "100%", padding: "0.5rem" }} />
+    <div className="flex h-screen flex-col bg-slate-50">
+      {/* Top bar */}
+      <header className="flex items-center justify-between gap-4 border-b border-slate-200 bg-white px-5 py-3">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-600 text-lg text-white">
+              🔒
             </div>
-            <div style={{ marginBottom: "1rem" }}>
-              <label>Password</label><br />
-              <input type="password" value={regPassword} onChange={(e) => setRegPassword(e.target.value)} required style={{ width: "100%", padding: "0.5rem" }} />
-            </div>
-            <button type="submit" style={{ padding: "0.5rem 1rem" }}>Register</button>
-          </form>
-          <p>{regResult}</p>
+            <span className="hidden text-base font-bold text-slate-900 sm:block">Secure Messenger</span>
+          </div>
 
-          <hr style={{ margin: "2rem 0" }} />
-
-          <h2>Login</h2>
-          <form onSubmit={handleLogin}>
-            <div style={{ marginBottom: "1rem" }}>
-              <label>Email</label><br />
-              <input type="email" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} required style={{ width: "100%", padding: "0.5rem" }} />
-            </div>
-            <div style={{ marginBottom: "1rem" }}>
-              <label>Password</label><br />
-              <input type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} required style={{ width: "100%", padding: "0.5rem" }} />
-            </div>
-            <button type="submit" style={{ padding: "0.5rem 1rem" }}>Login</button>
-          </form>
-          <p>{loginResult}</p>
-          <p>{keyStatus}</p>
-        </div>
-      )}
-
-      {token && (
-        <>
-          <p>
-            Logged in as <strong>{myEmailRef.current}</strong>{isAdmin && " (administrator)"}{" "}
-            <button onClick={handleLogout} style={{ marginLeft: "0.5rem", fontSize: "0.8rem" }}>Log out</button>
-          </p>
-          <p>{keyStatus}</p>
-          {myFingerprint && (
-            <p style={{ fontSize: "0.85rem", color: "#555" }}>
-              Your key fingerprint: <code>{myFingerprint}</code>
-            </p>
-          )}
-
-          {isAdmin && (
-            <div style={{ border: "2px solid #b00020", borderRadius: "6px", padding: "1rem", marginBottom: "2rem" }}>
-              <h2 style={{ marginTop: 0 }}>
-                Security Alerts{" "}
-                <span style={{ fontSize: "0.9rem", color: unreviewedCount ? "#b00020" : "#2e7d32" }}>
-                  ({unreviewedCount} unreviewed)
-                </span>
-              </h2>
-              <label style={{ fontSize: "0.85rem" }}>
-                <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />{" "}
-                Show reviewed alerts
-              </label>
-              {flagsError && <p style={{ color: "#b00020" }}>{flagsError}</p>}
-              {!flagsError && visibleFlags.length === 0 && (
-                <p style={{ color: "#555" }}>No alerts to show. The list refreshes every 5 seconds.</p>
-              )}
-              {visibleFlags.length > 0 && (
-                <div style={{ overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem", marginTop: "0.5rem" }}>
-                    <thead>
-                      <tr style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>
-                        <th style={{ padding: "0.4rem" }}>Time</th>
-                        <th style={{ padding: "0.4rem" }}>Account</th>
-                        <th style={{ padding: "0.4rem" }}>What was detected</th>
-                        <th style={{ padding: "0.4rem" }}>Score</th>
-                        <th style={{ padding: "0.4rem" }}></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visibleFlags.map((f) => (
-                        <tr key={f.id} style={{ borderBottom: "1px solid #eee", opacity: f.reviewed ? 0.5 : 1 }}>
-                          <td style={{ padding: "0.4rem", whiteSpace: "nowrap" }}>
-                            {f.flagged_at ? new Date(f.flagged_at).toLocaleTimeString() : ""}
-                          </td>
-                          <td style={{ padding: "0.4rem" }}>{f.subject}</td>
-                          <td style={{ padding: "0.4rem" }}>{f.reason}</td>
-                          <td style={{ padding: "0.4rem" }}>{f.anomaly_score.toFixed(2)}</td>
-                          <td style={{ padding: "0.4rem" }}>
-                            {f.reviewed ? "Reviewed" : (
-                              <button onClick={() => markReviewed(f.id)} style={{ fontSize: "0.75rem" }}>Mark reviewed</button>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div style={{ maxWidth: "520px" }}>
-            <h2>Contacts</h2>
-            {users.length === 0 && <p>No other users with uploaded keys yet.</p>}
-            <ul>
-              {users.map((u) => (
-                <li key={u.email}>
-                  <button onClick={() => handleSelectRecipient(u.email)} style={{ fontWeight: recipientEmail === u.email ? "bold" : "normal" }}>
-                    {u.email}
-                  </button>
-                </li>
-              ))}
-            </ul>
-
-            <h3>Messages</h3>
-            <div style={{ border: "1px solid #ccc", padding: "1rem", height: "200px", overflowY: "auto", marginBottom: "1rem" }}>
-              {chatLog.length === 0 && <p style={{ color: "#888" }}>No messages yet.</p>}
-              {chatLog.map((m, i) => (
-                <p key={i}>
-                  <strong>{m.from === "me" ? "You" : m.from}:</strong> {m.text}{" "}
-                  {m.from !== "me" && !m.rejected && (
-                    <span style={{ fontSize: "0.75rem", color: m.verified ? "green" : "red" }}>
-                      {m.verified ? "[signature verified]" : "[unverified / signature mismatch]"}
-                    </span>
-                  )}
-                  {m.offline && (
-                    <span style={{ fontSize: "0.75rem", color: "#555" }}> [received while you were offline]</span>
-                  )}
-                </p>
-              ))}
-            </div>
-
-            {recipientEmail && (
-              <>
-                <h3>Chat with {recipientEmail}</h3>
-                {recipientFingerprint && (
-                  <p style={{ fontSize: "0.85rem", color: "#555" }}>
-                    Their key fingerprint: <code>{recipientFingerprint}</code><br />
-                    Compare this with {recipientEmail} out-of-band (in person or by call) to confirm you're not being intercepted.
-                  </p>
+          <nav className="flex gap-1">
+            <button
+              onClick={() => setView("chat")}
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+                view === "chat" ? "bg-indigo-50 text-indigo-700" : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              Messages
+            </button>
+            {isAdmin && (
+              <button
+                onClick={() => setView("alerts")}
+                className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+                  view === "alerts" ? "bg-indigo-50 text-indigo-700" : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                Security alerts
+                {unreviewedCount > 0 && (
+                  <span className="rounded-full bg-red-600 px-2 py-0.5 text-[11px] font-semibold text-white">
+                    {unreviewedCount}
+                  </span>
                 )}
-                <form onSubmit={handleSendMessage}>
-                  <input
-                    type="text"
-                    value={messageText}
-                    onChange={(e) => setMessageText(e.target.value)}
-                    placeholder="Type an encrypted message..."
-                    style={{ width: "80%", padding: "0.5rem" }}
-                  />
-                  <button type="submit" style={{ padding: "0.5rem 1rem" }}>Send</button>
-                </form>
-                <button onClick={handleReplayLast} style={{ marginTop: "1rem", padding: "0.4rem 0.8rem", fontSize: "0.8rem" }}>
-                  Replay last sent message (test)
-                </button>
-              </>
+              </button>
+            )}
+          </nav>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <div className="hidden items-center gap-2 text-xs text-slate-500 md:flex">
+            <span className={`h-2 w-2 rounded-full ${keysReady ? "bg-emerald-500" : "bg-amber-400"}`}></span>
+            {keysReady ? "Keys ready" : keyStatus}
+            {myFingerprint && (
+              <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
+                {myFingerprint}
+              </code>
             )}
           </div>
-        </>
-      )}
+          <div className="flex items-center gap-2">
+            <Avatar email={myEmailRef.current} size="h-8 w-8 text-xs" />
+            <div className="hidden leading-tight sm:block">
+              <p className="text-sm font-medium text-slate-800">{myEmailRef.current}</p>
+              {isAdmin && <p className="text-[11px] font-semibold text-indigo-600">Administrator</p>}
+            </div>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+          >
+            Log out
+          </button>
+        </div>
+      </header>
+
+      {/* Main area */}
+      <main className="min-h-0 flex-1 overflow-hidden">
+        {view === "chat" || !isAdmin ? (
+          <Chat
+            users={users}
+            recipientEmail={recipientEmail}
+            onSelect={handleSelectRecipient}
+            recipientFingerprint={recipientFingerprint}
+            messages={conversation}
+            messageText={messageText}
+            setMessageText={setMessageText}
+            onSend={handleSendMessage}
+            onReplay={handleReplayLast}
+          />
+        ) : (
+          <div className="h-full overflow-y-auto">
+            <AlertsPanel
+              flags={flags}
+              error={flagsError}
+              showReviewed={showReviewed}
+              setShowReviewed={setShowReviewed}
+              onReview={markReviewed}
+            />
+          </div>
+        )}
+      </main>
     </div>
   );
 }
