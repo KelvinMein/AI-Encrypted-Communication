@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import AuthScreen from "./components/AuthScreen";
 import Chat, { Avatar } from "./components/Chat";
 import AlertsPanel from "./components/AlertsPanel";
+import NotificationBell from "./components/NotificationBell";
 
 const MAX_MESSAGE_AGE_MS = 60 * 1000; // live messages older than 60 seconds are rejected
 const ADMIN_EMAILS = ["kelvin@example.com"]; // cosmetic only: the server enforces admin access
@@ -49,10 +50,12 @@ function App() {
   const [recipientFingerprint, setRecipientFingerprint] = useState("");
   const [messageText, setMessageText] = useState("");
   const [chatLog, setChatLog] = useState([]);
+  const [unread, setUnread] = useState({});
 
   const [view, setView] = useState("chat");
   const [isAdmin, setIsAdmin] = useState(false);
   const [flags, setFlags] = useState([]);
+  const [flagsLoaded, setFlagsLoaded] = useState(false);
   const [flagsError, setFlagsError] = useState("");
   const [showReviewed, setShowReviewed] = useState(false);
 
@@ -65,6 +68,21 @@ function App() {
   const wsRef = useRef(null);
   const myEmailRef = useRef("");
   const tokenRef = useRef("");
+  const recipientRef = useRef("");   // mirrors recipientEmail, for use inside the WebSocket handler
+  const viewRef = useRef("chat");    // mirrors view, for the same reason
+
+  function changeView(next) {
+    setView(next);
+    viewRef.current = next;
+  }
+
+  // Counts a message as unread unless you are looking at that conversation right now
+  function markUnread(from) {
+    const viewing = viewRef.current === "chat" && recipientRef.current === from;
+    if (!viewing) {
+      setUnread((prev) => ({ ...prev, [from]: (prev[from] || 0) + 1 }));
+    }
+  }
 
   // ---- Admin: load and refresh anomaly flags ----
   async function loadFlags() {
@@ -79,6 +97,7 @@ function App() {
       }
       setFlagsError("");
       setFlags(await response.json());
+      setFlagsLoaded(true);
     } catch (err) {
       setFlagsError("Could not reach the server.");
     }
@@ -99,6 +118,19 @@ function App() {
     return () => clearInterval(timer);
   }, [isAdmin, token]);
 
+  // Browser tab title shows the total unread count
+  useEffect(() => {
+    const total = Object.values(unread).reduce((a, b) => a + b, 0);
+    document.title = total > 0 ? `(${total}) Secure Messenger` : "Secure Messenger";
+  }, [unread]);
+
+  // Opening a conversation (or returning to the chat tab) clears its unread count
+  useEffect(() => {
+    if (view === "chat" && recipientEmail) {
+      setUnread((prev) => (prev[recipientEmail] ? { ...prev, [recipientEmail]: 0 } : prev));
+    }
+  }, [view, recipientEmail]);
+
   async function handleRegister(email, password) {
     setRegResult("Creating account...");
     try {
@@ -109,8 +141,10 @@ function App() {
       });
       const data = await response.json();
       setRegResult(response.ok ? `Account created for ${data.email}. You can log in now.` : `Error: ${data.detail}`);
+      return response.ok;
     } catch (err) {
       setRegResult(`Network error: ${err.message}`);
+      return false;
     }
   }
 
@@ -280,6 +314,7 @@ function App() {
           ...prev,
           { peer: data.from, from: data.from, text, verified: signatureValid, offline: !!data.offline, time: data.timestamp },
         ]);
+        markUnread(data.from);
       } catch (err) {
         setChatLog((prev) => [
           ...prev,
@@ -318,6 +353,8 @@ function App() {
 
   async function handleSelectRecipient(email) {
     setRecipientEmail(email);
+    recipientRef.current = email;
+    setUnread((prev) => ({ ...prev, [email]: 0 }));
     setRecipientFingerprint("");
 
     const peer = await getPeerKeys(email);
@@ -408,6 +445,7 @@ function App() {
   const unreviewedCount = flags.filter((f) => !f.reviewed).length;
   const conversation = chatLog.filter((m) => m.peer === recipientEmail);
   const keysReady = keyStatus.startsWith("Encryption and signing keys ready");
+  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
 
   return (
     <div className="flex h-screen flex-col bg-slate-50">
@@ -423,16 +461,21 @@ function App() {
 
           <nav className="flex gap-1">
             <button
-              onClick={() => setView("chat")}
-              className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+              onClick={() => changeView("chat")}
+              className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                 view === "chat" ? "bg-indigo-50 text-indigo-700" : "text-slate-500 hover:text-slate-800"
               }`}
             >
               Messages
+              {totalUnread > 0 && (
+                <span className="rounded-full bg-indigo-600 px-2 py-0.5 text-[11px] font-semibold text-white">
+                  {totalUnread}
+                </span>
+              )}
             </button>
             {isAdmin && (
               <button
-                onClick={() => setView("alerts")}
+                onClick={() => changeView("alerts")}
                 className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                   view === "alerts" ? "bg-indigo-50 text-indigo-700" : "text-slate-500 hover:text-slate-800"
                 }`}
@@ -458,6 +501,16 @@ function App() {
               </code>
             )}
           </div>
+
+          {isAdmin && (
+            <NotificationBell
+              flags={flags}
+              ready={flagsLoaded}
+              onReview={markReviewed}
+              onViewAll={() => changeView("alerts")}
+            />
+          )}
+
           <div className="flex items-center gap-2">
             <Avatar email={myEmailRef.current} size="h-8 w-8 text-xs" />
             <div className="hidden leading-tight sm:block">
@@ -479,6 +532,7 @@ function App() {
         {view === "chat" || !isAdmin ? (
           <Chat
             users={users}
+            unread={unread}
             recipientEmail={recipientEmail}
             onSelect={handleSelectRecipient}
             recipientFingerprint={recipientFingerprint}

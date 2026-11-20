@@ -6,6 +6,12 @@ const FEATURES = [
   { icon: "🛡️", title: "AI threat monitoring", text: "Suspicious activity is flagged to administrators in real time." },
 ];
 
+function Spinner() {
+  return (
+    <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+  );
+}
+
 export default function AuthScreen({
   onRegister,
   onLogin,
@@ -17,15 +23,37 @@ export default function AuthScreen({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
 
   const isLogin = tab === "login";
   const message = isLogin ? loginResult : registerResult;
   const isError = /error|failed|network/i.test(message || "");
 
-  function submit(e) {
+  function switchTab(next) {
+    setTab(next);
+    setNotice("");
+  }
+
+  async function submit(e) {
     e.preventDefault();
-    if (isLogin) onLogin(email, password);
-    else onRegister(email, password);
+    if (busy) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      if (isLogin) {
+        await onLogin(email, password);
+      } else {
+        const ok = await onRegister(email, password);
+        if (ok) {
+          setTab("login");
+          setPassword("");
+          setNotice(`Account created for ${email}. Log in to continue.`);
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -82,7 +110,7 @@ export default function AuthScreen({
           <div className="mt-6 grid grid-cols-2 rounded-xl bg-slate-100 p-1 text-sm font-medium">
             <button
               type="button"
-              onClick={() => setTab("login")}
+              onClick={() => switchTab("login")}
               className={`rounded-lg py-2 transition ${
                 isLogin ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
               }`}
@@ -91,7 +119,7 @@ export default function AuthScreen({
             </button>
             <button
               type="button"
-              onClick={() => setTab("register")}
+              onClick={() => switchTab("register")}
               className={`rounded-lg py-2 transition ${
                 !isLogin ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
               }`}
@@ -108,8 +136,9 @@ export default function AuthScreen({
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                disabled={busy}
                 placeholder="you@example.com"
-                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100"
+                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-50"
               />
             </div>
 
@@ -121,8 +150,9 @@ export default function AuthScreen({
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  disabled={busy}
                   placeholder="Enter your password"
-                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 pr-16 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100"
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 pr-16 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-50"
                 />
                 <button
                   type="button"
@@ -136,13 +166,29 @@ export default function AuthScreen({
 
             <button
               type="submit"
-              className="w-full rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-200 transition hover:bg-indigo-700 active:scale-[0.99]"
+              disabled={busy}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-200 transition hover:bg-indigo-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-70"
             >
-              {isLogin ? "Log in" : "Create account"}
+              {busy && <Spinner />}
+              {busy
+                ? isLogin
+                  ? "Logging in..."
+                  : "Creating account..."
+                : isLogin
+                ? "Log in"
+                : "Create account"}
             </button>
           </form>
 
-          {message && (
+          {busy && isLogin && keyStatus && (
+            <p className="mt-3 text-center text-xs text-slate-500">{keyStatus}</p>
+          )}
+
+          {isLogin && notice && !busy && (
+            <div className="mt-4 rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{notice}</div>
+          )}
+
+          {message && !busy && !(isLogin && notice) && (
             <div
               className={`mt-4 rounded-xl px-4 py-3 text-sm ${
                 isError ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"
@@ -150,9 +196,6 @@ export default function AuthScreen({
             >
               {message}
             </div>
-          )}
-          {isLogin && keyStatus && (
-            <p className="mt-3 text-center text-xs text-slate-500">{keyStatus}</p>
           )}
 
           <p className="mt-8 text-center text-xs text-slate-400">

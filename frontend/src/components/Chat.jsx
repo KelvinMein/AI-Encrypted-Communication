@@ -122,6 +122,7 @@ function MessageBody({ text, mine }) {
 
 export default function Chat({
   users,
+  unread = {},
   recipientEmail,
   onSelect,
   recipientFingerprint,
@@ -148,21 +149,37 @@ export default function Chat({
           {users.length === 0 && (
             <p className="px-5 py-4 text-sm text-slate-400">No other users with uploaded keys yet.</p>
           )}
-          {users.map((u) => (
-            <button
-              key={u.email}
-              onClick={() => onSelect(u.email)}
-              className={`flex w-full items-center gap-3 px-5 py-3 text-left transition hover:bg-slate-50 ${
-                recipientEmail === u.email ? "bg-indigo-50" : ""
-              }`}
-            >
-              <Avatar email={u.email} />
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium text-slate-800">{u.email}</p>
-                <p className="text-xs text-slate-400">Encrypted chat</p>
-              </div>
-            </button>
-          ))}
+          {users.map((u) => {
+            const count = unread[u.email] || 0;
+            return (
+              <button
+                key={u.email}
+                onClick={() => onSelect(u.email)}
+                className={`flex w-full items-center gap-3 px-5 py-3 text-left transition hover:bg-slate-50 ${
+                  recipientEmail === u.email ? "bg-indigo-50" : ""
+                }`}
+              >
+                <Avatar email={u.email} />
+                <div className="min-w-0 flex-1">
+                  <p
+                    className={`truncate text-sm text-slate-800 ${
+                      count > 0 ? "font-bold" : "font-medium"
+                    }`}
+                  >
+                    {u.email}
+                  </p>
+                  <p className={`text-xs ${count > 0 ? "font-medium text-indigo-600" : "text-slate-400"}`}>
+                    {count > 0 ? `${count} new message${count > 1 ? "s" : ""}` : "Encrypted chat"}
+                  </p>
+                </div>
+                {count > 0 && (
+                  <span className="flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-indigo-600 px-1.5 text-[11px] font-semibold text-white">
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
       </aside>
 
