@@ -18,10 +18,10 @@ from app import ratelimit
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# Accounts allowed to see logs and anomaly flags, read from ADMIN_EMAILS in backend/.env
-ADMIN_EMAILS = {
-    e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
-}
+# Accounts allowed to see logs and anomaly flags, read from ADMIN_EMAILS in backend/.env.
+# Compared exactly as written: the database treats "Kelvin@..." and "kelvin@..." as
+# different accounts, so a case-insensitive check would let anyone register a look-alike.
+ADMIN_EMAILS = {e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
 
 
 def get_client_ip(request: Request):
@@ -45,7 +45,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 
 def require_admin(current_user: User = Depends(get_current_user)):
-    if current_user.email.lower() not in ADMIN_EMAILS:
+    if current_user.email not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Administrator access required")
     return current_user
 
