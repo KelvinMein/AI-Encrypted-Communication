@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -11,12 +13,15 @@ from app.models.anomaly_flag import AnomalyFlag
 from app.schemas import UserCreate, UserOut, UserLogin, Token, PublicKeyUpload
 from app.auth import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
 from app.logger import log_event
+from app import ratelimit
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# Accounts allowed to see logs and anomaly flags. Hard-coded for now.
-ADMIN_EMAILS = {"kelvin@example.com"}
+# Accounts allowed to see logs and anomaly flags, read from ADMIN_EMAILS in backend/.env
+ADMIN_EMAILS = {
+    e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
+}
 
 
 def get_client_ip(request: Request):
@@ -40,7 +45,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 
 def require_admin(current_user: User = Depends(get_current_user)):
-    if current_user.email not in ADMIN_EMAILS:
+    if current_user.email.lower() not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Administrator access required")
     return current_user
 
@@ -67,9 +72,31 @@ def register(user: UserCreate, request: Request, db: Session = Depends(get_db)):
 @router.post("/login", response_model=Token)
 def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db)):
     ip = get_client_ip(request)
+    email_key = credentials.email.strip().lower()
+    account_key = f"{ip}|{email_key}"
+    ip_key = ip or "unknown"
+    limiting = ratelimit.enabled()
+
+    # Refuse the attempt outright if a limit has been hit (even a correct password is refused)
+    if limiting:
+        wait = max(
+            ratelimit.account_limiter.retry_after(account_key),
+            ratelimit.ip_limiter.retry_after(ip_key),
+        )
+        if wait:
+            log_event(db, "login_blocked", status="blocked", email=credentials.email, ip_address=ip)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Try again in {wait} seconds.",
+                headers={"Retry-After": str(wait)},
+            )
+
     user = db.query(User).filter(User.email == credentials.email).first()
 
     if not user or not verify_password(credentials.password, user.hashed_password):
+        if limiting:
+            ratelimit.account_limiter.record_failure(account_key)
+            ratelimit.ip_limiter.record_failure(ip_key)
         log_event(
             db, "login_failure", status="failed",
             user_id=user.id if user else None,
@@ -77,6 +104,7 @@ def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db
         )
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    ratelimit.account_limiter.clear(account_key)
     log_event(db, "login_success", user_id=user.id, email=user.email, ip_address=ip)
     access_token = create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
