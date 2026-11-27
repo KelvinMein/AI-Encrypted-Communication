@@ -1,76 +1,83 @@
-import os
+import re
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from jose import jwt, JWTError
+from sqlalchemy.orm import Session
 
+from app import mailer, ratelimit
+from app.sessions import start_session
+from app.auth import create_access_token, hash_password, verify_password
 from app.database import get_db
-from app.models.user import User
-from app.models.metadata_log import MetadataLog
-from app.models.anomaly_flag import AnomalyFlag
-from app.schemas import UserCreate, UserOut, UserLogin, Token, PublicKeyUpload
-from app.auth import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
+from app.deps import ADMIN_EMAILS, get_client_ip, get_current_user
 from app.logger import log_event
-from app import ratelimit
+from app.models.message import Message
+from app.models.user import User
+from app.schemas import PublicKeyUpload, Token, UserCreate, UserLogin, UserOut
 
 router = APIRouter()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# Accounts allowed to see logs and anomaly flags, read from ADMIN_EMAILS in backend/.env.
-# Compared exactly as written: the database treats "Kelvin@..." and "kelvin@..." as
-# different accounts, so a case-insensitive check would let anyone register a look-alike.
-ADMIN_EMAILS = {e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
-
-
-def get_client_ip(request: Request):
-    return request.client.host if request.client else None
-
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(User).filter(User.email == email).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
-
-def require_admin(current_user: User = Depends(get_current_user)):
-    if current_user.email not in ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Administrator access required")
-    return current_user
+TERMS_VERSION = "1.0"
+MIN_PASSWORD_LENGTH = 8
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,20}$")
+RESERVED_USERNAMES = {"admin", "administrator", "root", "support", "system", "moderator", "staff", "security"}
 
 
 @router.post("/register", response_model=UserOut)
 def register(user: UserCreate, request: Request, db: Session = Depends(get_db)):
     ip = get_client_ip(request)
-    hashed_pw = hash_password(user.password)
-    new_user = User(email=user.email, hashed_password=hashed_pw)
 
+    if not user.accept_terms:
+        raise HTTPException(status_code=400, detail="You must agree to the rules to create an account.")
+
+    username = user.username.strip()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3 to 20 characters: letters, numbers, dots, dashes or underscores.",
+        )
+    if username.lower() in RESERVED_USERNAMES:
+        raise HTTPException(status_code=400, detail="That username is not available.")
+    if len(user.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+
+    if db.query(User.id).filter(User.email == user.email).first():
+        log_event(db, "register", status="failed", email=user.email, ip_address=ip)
+        raise HTTPException(status_code=400, detail="Email already registered")
+    if db.query(User.id).filter(func.lower(User.username) == username.lower()).first():
+        raise HTTPException(status_code=400, detail="That username is already taken.")
+
+    new_user = User(
+        email=user.email,
+        username=username,
+        hashed_password=hash_password(user.password),
+        role="admin" if user.email in ADMIN_EMAILS else "user",
+        terms_accepted_at=datetime.now(timezone.utc),
+        terms_version=TERMS_VERSION,
+    )
     db.add(new_user)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        log_event(db, "register", status="failed", email=user.email, ip_address=ip)
-        raise HTTPException(status_code=400, detail="Email already registered")
+        taken_email = db.query(User.id).filter(User.email == user.email).first()
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered" if taken_email else "That username is already taken.",
+        )
 
     db.refresh(new_user)
     log_event(db, "register", user_id=new_user.id, email=new_user.email, ip_address=ip)
     return new_user
 
-
 @router.post("/login", response_model=Token)
-def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db)):
+def login(
+    credentials: UserLogin,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     ip = get_client_ip(request)
     email_key = credentials.email.strip().lower()
     account_key = f"{ip}|{email_key}"
@@ -104,10 +111,37 @@ def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db
         )
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    # Only someone who knows the password learns the account is deactivated
+    if not user.is_active:
+        log_event(db, "login_denied", status="deactivated", user_id=user.id, email=user.email, ip_address=ip)
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been deactivated. Contact an administrator.",
+        )
+
     ratelimit.account_limiter.clear(account_key)
+    started = start_session(db, user, request, credentials.device_id)
     log_event(db, "login_success", user_id=user.id, email=user.email, ip_address=ip)
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    if started["unfamiliar"]:
+        log_event(db, "login_new_device", status=started["label"][:100], user_id=user.id,
+                  email=user.email, ip_address=ip)
+        background.add_task(
+            mailer.send_email,
+            user.email,
+            "New sign-in to your account",
+            f"Hello {user.username},\n\nYour account was just signed in to from a device we have not seen before:\n\n"
+            f"  {started['label']}\n  Address: {started['ip'] or 'unknown'}\n\n"
+            "If this was you, no action is needed. If it was not, open Security centre, sign out the unfamiliar "
+            "session, and change your password.\n",
+        )
+
+    return {
+        "access_token": create_access_token(data={"sub": user.email, "sid": started["sid"]}),
+        "token_type": "bearer",
+        "username": user.username,
+        "role": user.role,
+    }
 
 
 @router.post("/upload-key")
@@ -127,76 +161,53 @@ def upload_key(
 
 
 @router.get("/users")
-def list_users(db: Session = Depends(get_db)):
-    users = db.query(User).filter(User.public_key.isnot(None)).all()
+def list_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Contacts, by username only. Emails are never returned here."""
+    users = (
+        db.query(User)
+        .filter(User.public_key.isnot(None), User.is_active.is_(True))
+        .all()
+    )
     return [
-        {"email": u.email, "public_key": u.public_key, "signing_key": u.signing_key}
+        {"username": u.username, "public_key": u.public_key, "signing_key": u.signing_key}
         for u in users
     ]
 
 
-@router.get("/logs")
-def list_logs(
-    limit: int = 50,
-    admin: User = Depends(require_admin),
+@router.get("/messages")
+def my_messages(
+    limit: int = 500,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """The caller's own conversation history, as ciphertext only, with usernames."""
     rows = (
-        db.query(MetadataLog)
-        .order_by(MetadataLog.id.desc())
-        .limit(min(limit, 500))
+        db.query(Message)
+        .filter(or_(Message.sender_id == current_user.id, Message.receiver_id == current_user.id))
+        .order_by(Message.id.desc())
+        .limit(min(limit, 1000))
         .all()
     )
+    rows.reverse()
+
+    ids = {r.sender_id for r in rows} | {r.receiver_id for r in rows}
+    names = {u.id: u.username for u in db.query(User).filter(User.id.in_(ids)).all()} if ids else {}
+
     return [
         {
-            "id": r.id,
-            "event_type": r.event_type,
-            "status": r.status,
-            "email": r.email,
-            "recipient_email": r.recipient_email,
-            "ip_address": r.ip_address,
-            "size_bytes": r.size_bytes,
-            "occurred_at": r.occurred_at.isoformat() if r.occurred_at else None,
+            "from": names.get(r.sender_id),
+            "to": names.get(r.receiver_id),
+            "ciphertext": r.ciphertext,
+            "nonce": r.nonce,
+            "signature": r.signature,
+            "msg_id": r.msg_id,
+            "timestamp": r.timestamp,
+            "delivered": r.delivered,
         }
         for r in rows
     ]
 
 
-@router.get("/flags")
-def list_flags(
-    limit: int = 100,
-    admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
-):
-    rows = (
-        db.query(AnomalyFlag)
-        .order_by(AnomalyFlag.id.desc())
-        .limit(min(limit, 500))
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "subject": r.subject,
-            "email": r.email,
-            "anomaly_score": r.anomaly_score,
-            "reason": r.reason,
-            "reviewed": r.reviewed,
-            "flagged_at": r.flagged_at.isoformat() if r.flagged_at else None,
-        }
-        for r in rows
-    ]
+from app.routes.password_routes import router as password_router  # noqa: E402
 
-
-@router.post("/flags/{flag_id}/review")
-def review_flag(
-    flag_id: int,
-    admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
-):
-    flag = db.query(AnomalyFlag).filter(AnomalyFlag.id == flag_id).first()
-    if flag is None:
-        raise HTTPException(status_code=404, detail="Flag not found")
-    flag.reviewed = True
-    db.commit()
-    return {"message": "Flag marked as reviewed"}
+router.include_router(password_router)

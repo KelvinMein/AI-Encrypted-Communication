@@ -1,0 +1,12 @@
+BEGIN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR NOT NULL DEFAULT 'user';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_reason TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version VARCHAR;
+UPDATE users SET username = split_part(email, '@', 1) WHERE username IS NULL;
+ALTER TABLE users ALTER COLUMN username SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username_lower ON users (lower(username));
+UPDATE users SET role = 'admin' WHERE email = 'kelvin@example.com';
+COMMIT;

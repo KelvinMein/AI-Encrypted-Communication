@@ -1,3 +1,4 @@
+
 """Shared test setup.
 
 Every test runs against a separate database (encrypted_comm_test_db), never the real one.
@@ -67,8 +68,14 @@ def client():
 
 @pytest.fixture
 def register(client):
-    def _register(email, password=PASSWORD):
-        return client.post("/register", json={"email": email, "password": password})
+    def _register(email, password=PASSWORD, username=None, accept_terms=True):
+        if username is None:  # default: the part of the email before the @
+            username = re.sub(r"[^A-Za-z0-9_.-]", "_", email.split("@")[0])
+            username = (username + "___")[:20] if len(username) < 3 else username[:20]
+        return client.post(
+            "/register",
+            json={"email": email, "username": username, "password": password, "accept_terms": accept_terms},
+        )
     return _register
 
 
@@ -124,6 +131,7 @@ def wait_for():
 def ws_payload():
     """A relay message as the browser would send it (random-looking ciphertext)."""
     def _make(to, n=1, ciphertext="Q0lQSEVSVEVYVA=="):
+        to = to.split("@")[0]
         return {
             "to": to,
             "ciphertext": ciphertext,
